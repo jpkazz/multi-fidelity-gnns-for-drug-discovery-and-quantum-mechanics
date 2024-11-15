@@ -25,14 +25,21 @@ from typing import Optional
 from .set_transformer_models import SetTransformer
 from .reporting import get_metrics_pt, get_metrics_cls_pt
 
-torch.set_num_threads(1)
+torch.set_num_threads(1) # Limit CPU threading for better performance.
 
-
+# Utility function to compute node degrees from a list of graph datasets.
+# Degrees are useful for aggregators like PNA (Principal Neighborhood Aggregation).
 def get_degrees(train_dataset_as_list):
-    deg = torch.zeros(10, dtype=torch.long)
+    """
+    Computes degree statistics from a list of graph data objects.
+    Args: train_dataset_as_list (list): A list of graph data objects from a PyTorch Geometric dataset.
+    Returns: torch.Tensor: A histogram of node degrees.
+    """
+    deg = torch.zeros(10, dtype=torch.long) # Initialize a tensor to store degree counts.
     print("Computing degrees for PNA...")
-    for data in tqdm(train_dataset_as_list):
+    for data in tqdm(train_dataset_as_list): # Iterate through each graph in the dataset.
         d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
+        # Update the degree histogram with the current graph's degree distribution.
         deg += torch.bincount(d, minlength=deg.numel())
 
     return deg
@@ -42,7 +49,18 @@ def get_degrees(train_dataset_as_list):
 
 
 # Taken and adapted from https://github.com/rusty1s/pytorch_geometric/blob/master/examples/autoencoder.py
+# Implements a variational encoder for graph-based data using GCN layers.
 class VariationalGCNEncoder(pl.LightningModule):
+    """
+    A variational encoder using graph convolutional layers (GCN).
+    Args:
+        in_channels (int): Number of input features per node.
+        intermediate_dim (int): Dimension of the intermediate hidden layers.
+        use_batch_norm (bool): Whether to use batch normalization between layers.
+        out_channels (int): Dimension of the latent space.
+        num_layers (int): Number of GCN layers in the encoder.
+        name (str, optional): Optional name for the encoder.
+    """
     def __init__(
         self,
         in_channels: int,
@@ -53,13 +71,15 @@ class VariationalGCNEncoder(pl.LightningModule):
         name: str = None,
     ):
         super(VariationalGCNEncoder, self).__init__()
-        self.use_batch_norm = use_batch_norm
-        self.num_layers = num_layers
+        self.use_batch_norm = use_batch_norm # Flag to enable/disable batch normalization.
+        self.num_layers = num_layers # Number of GCN layers in the model.
 
-        modules = []
+        modules = [] # Store the sequence of GCN layers and activation functions.
 
+        # Construct GCN layers with optional batch normalization and ReLU activation.
         for i in range(self.num_layers):
             if i == 0:
+                # First layer transforms input features to intermediate dimensions.
                 modules.append(
                     (
                         GCNConv(in_channels, intermediate_dim, cached=False),
@@ -67,6 +87,7 @@ class VariationalGCNEncoder(pl.LightningModule):
                     )
                 )
             else:
+                # Subsequent layers operate within the intermediate dimensions.
                 modules.append(
                     (
                         GCNConv(intermediate_dim, intermediate_dim, cached=False),
@@ -74,22 +95,43 @@ class VariationalGCNEncoder(pl.LightningModule):
                     )
                 )
 
-            if self.use_batch_norm:
+            if self.use_batch_norm: # Apply batch normalization if enabled.
                 modules.append(BatchNorm(intermediate_dim))
-            modules.append(nn.ReLU(inplace=True))
+            modules.append(nn.ReLU(inplace=True)) # Apply ReLU activation.
 
+        # Sequentially chain all the GCN layers, batch norms, and activations.
         self.convs = torch_geometric.nn.Sequential("x, edge_index", modules)
-
+        # Define the output layers for latent mean (mu) and log variance (logstd).
         self.conv_mu = GCNConv(intermediate_dim, out_channels, cached=False)
         self.conv_logstd = GCNConv(intermediate_dim, out_channels, cached=False)
 
     def forward(self, x, edge_index):
-        x = self.convs(x, edge_index)
-
+        """
+        Forward pass through the variational encoder.
+        Args:
+            x (torch.Tensor): Node feature matrix of shape [num_nodes, in_channels].
+            edge_index (torch.Tensor): Edge index tensor defining graph connectivity.
+        Returns:
+            torch.Tensor: Latent mean (mu) of shape [num_nodes, out_channels].
+            torch.Tensor: Latent log variance (logstd) of shape [num_nodes, out_channels].
+        """
+        x = self.convs(x, edge_index) # Pass input through the GCN layers.
+        # Compute latent mean and log variance from the final layer outputs.
         return self.conv_mu(x, edge_index), self.conv_logstd(x, edge_index)
 
-
+# Implements a variational encoder for graph-based data using GIN layers.
 class VariationalGINEncoder(pl.LightningModule):
+    """
+    A variational encoder using GINConv and GINEConv layers for graph representation learning.
+    Args:
+        in_channels (int): Number of input features per node.
+        intermediate_dim (int): Dimension of intermediate hidden layers.
+        use_batch_norm (bool): Whether to apply batch normalization after each layer.
+        out_channels (int): Dimension of the latent space.
+        num_layers (int): Number of GINConv or GINEConv layers in the encoder.
+        edge_dim (int, optional): Dimension of edge features (required for GINEConv).
+        name (str, optional): Optional name for the encoder.
+    """
     def __init__(
         self,
         in_channels: int,
@@ -101,15 +143,18 @@ class VariationalGINEncoder(pl.LightningModule):
         name: str = None,
     ):
         super(VariationalGINEncoder, self).__init__()
-        self.edge_dim = edge_dim
-        self.use_batch_norm = use_batch_norm
-        self.num_layers = num_layers
+        self.edge_dim = edge_dim # Dimension of edge features; determines GINConv or GINEConv usage.
+        self.use_batch_norm = use_batch_norm # Flag to enable/disable batch normalization.
+        self.num_layers = num_layers # Number of convolutional layers.
 
-        modules = []
+        modules = [] # List to store the sequential layers.
 
+        # Build the encoder layers.
         for i in range(self.num_layers):
             if i == 0:
+                # First layer: transforms input node features to intermediate dimensions.
                 if self.edge_dim:
+                    # Use GINEConv when edge features are present.
                     modules.append(
                         (
                             GINEConv(
@@ -118,12 +163,13 @@ class VariationalGINEncoder(pl.LightningModule):
                                     ReLU(),
                                     Linear(intermediate_dim, intermediate_dim),
                                 ),
-                                edge_dim=self.edge_dim,
+                                edge_dim=self.edge_dim, # Include edge feature dimensions.
                             ),
                             "x, edge_index, edge_attr -> x",
                         )
                     )
                 else:
+                    # Use GINConv when edge features are absent.
                     modules.append(
                         (
                             GINConv(
@@ -137,6 +183,7 @@ class VariationalGINEncoder(pl.LightningModule):
                         )
                     )
             else:
+                # Subsequent layers: operate within intermediate dimensions.
                 if self.edge_dim:
                     modules.append(
                         (
@@ -166,9 +213,11 @@ class VariationalGINEncoder(pl.LightningModule):
                     )
 
             if self.use_batch_norm:
+                # Add batch normalization if enabled.
                 modules.append(BatchNorm(intermediate_dim))
-            modules.append(nn.ReLU(inplace=True))
+            modules.append(nn.ReLU(inplace=True)) # Add ReLU activation.
 
+        # Define the sequential module based on edge feature availability.
         if self.edge_dim:
             self.convs = torch_geometric.nn.Sequential(
                 "x, edge_index, edge_attr", modules
@@ -176,39 +225,57 @@ class VariationalGINEncoder(pl.LightningModule):
         else:
             self.convs = torch_geometric.nn.Sequential("x, edge_index", modules)
 
+        # Define the output layers for latent mean (mu) and log variance (logstd).
         nn_mu = nn.Sequential(
-            Linear(intermediate_dim, out_channels),
+            Linear(intermediate_dim, out_channels), # Linear layer to map to latent space.
             ReLU(),
-            Linear(out_channels, out_channels),
+            Linear(out_channels, out_channels), # Final layer for the mean representation.
         )
         if self.edge_dim:
+            # Use GINEConv for latent mean if edge features are present.
             self.conv_mu = GINEConv(nn_mu, edge_dim=self.edge_dim)
         else:
+            # Use GINConv for latent mean if edge features are absent.
             self.conv_mu = GINConv(nn_mu)
 
         nn_sigma = nn.Sequential(
-            Linear(intermediate_dim, out_channels),
+            Linear(intermediate_dim, out_channels), # Linear layer to map to latent space.
             ReLU(),
-            Linear(out_channels, out_channels),
+            Linear(out_channels, out_channels), # Final layer for log-variance representation.
         )
         if self.edge_dim:
+            # Use GINEConv for latent logstd if edge features are present.
             self.conv_logstd = GINEConv(nn_sigma, edge_dim=self.edge_dim)
         else:
+            # Use GINConv for latent logstd if edge features are absent.
             self.conv_logstd = GINConv(nn_sigma)
 
     def forward(self, x, edge_index, edge_attr=None):
+        """
+        Forward pass through the encoder.
+        Args:
+            x (torch.Tensor): Node feature matrix of shape [num_nodes, in_channels].
+            edge_index (torch.Tensor): Edge index tensor defining graph connectivity.
+            edge_attr (torch.Tensor, optional): Edge feature matrix of shape [num_edges, edge_dim].
+        Returns:
+            torch.Tensor: Latent mean (mu) of shape [num_nodes, out_channels].
+            torch.Tensor: Latent log variance (sigma) of shape [num_nodes, out_channels].
+        """
         if self.edge_dim:
+            # Pass input through the encoder with edge features.
             x = self.convs(x, edge_index, edge_attr=edge_attr)
         else:
+            # Pass input through the encoder without edge features.
             x = self.convs(x, edge_index)
 
+        # Compute latent mean and log variance.
         if self.edge_dim:
             mu = self.conv_mu(x, edge_index, edge_attr=edge_attr)
             sigma = self.conv_logstd(x, edge_index, edge_attr=edge_attr)
         else:
             mu = self.conv_mu(x, edge_index)
             sigma = self.conv_logstd(x, edge_index)
-        return mu, sigma
+        return mu, sigma # Return the latent mean and log variance.
 
 
 class VariationalPNAEncoder(pl.LightningModule):
