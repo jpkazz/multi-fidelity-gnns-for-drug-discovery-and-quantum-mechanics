@@ -1,3 +1,10 @@
+# This code defines core components of the SetTransformer model, which is designed to handle unordered set inputs 
+# with permutation-invariant representations. It includes several key modules:
+# - Multihead Attention Block (MAB) for applying multi-head attention to query, key, and value inputs.
+# - Self-Attention Block (SAB), which applies MAB with identical inputs for query and key, enabling self-attention.
+# - Induced Self-Attention Block (ISAB) for dimensionality reduction using learned inducing points.
+# - Pooling by Multihead Attention (PMA) to aggregate set elements into a fixed number of "seed" elements for downstream tasks.
+# These modules are intended to be combined to build a SetTransformer, facilitating tasks like clustering and set representation learning.
 # Code from https://github.com/juho-lee/set_transformer
 
 import torch
