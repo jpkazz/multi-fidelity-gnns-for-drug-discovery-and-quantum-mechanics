@@ -279,6 +279,18 @@ class VariationalGINEncoder(pl.LightningModule):
 
 
 class VariationalPNAEncoder(pl.LightningModule):
+    """
+    A PyTorch Lightning module for a variational encoder using Principal Neighbourhood Aggregation (PNA) convolutions.
+    Attributes:
+        in_channels: Input feature dimensionality.
+        intermediate_dim: Dimensionality of intermediate representations.
+        use_batch_norm: Whether to apply Batch Normalization.
+        out_channels: Dimensionality of the output representation.
+        num_layers: Number of PNA convolution layers.
+        train_dataset: Dataset used to compute node degree distribution.
+        edge_dim: Dimensionality of edge features (optional).
+        name: Name of the module (optional).
+    """
     def __init__(
         self,
         in_channels: int,
@@ -294,31 +306,35 @@ class VariationalPNAEncoder(pl.LightningModule):
         self.edge_dim = edge_dim
         self.use_batch_norm = use_batch_norm
         self.num_layers = num_layers
+        # PNA aggregators and scalers setup
+        aggregators = ["mean", "min", "max", "std"] # Aggregate information from neighbors in different ways.
+        scalers = ["identity", "amplification", "attenuation"] # Scale node features during aggregation.
+        deg = get_degrees(train_dataset) # Compute degree distribution from the training dataset.
 
-        aggregators = ["mean", "min", "max", "std"]
-        scalers = ["identity", "amplification", "attenuation"]
-        deg = get_degrees(train_dataset)
+        pna_num_towers = 5 # Number of towers for PNA convolution.
 
-        pna_num_towers = 5
-
+        # Common arguments for all PNA layers
         pna_common_args = dict(
             aggregators=aggregators,
             scalers=scalers,
             deg=deg,
-            edge_dim=None,
+            edge_dim=None, # Updated later if edge_dim is provided.
             towers=pna_num_towers,
-            pre_layers=1,
-            post_layers=1,
-            divide_input=False,
+            pre_layers=1, # Layers before aggregation.
+            post_layers=1, # Layers after aggregation.
+            divide_input=False, # Do not split input channels across towers.
         )
 
         if self.edge_dim:
+            # Add edge feature dimensionality if provided.
             pna_common_args = pna_common_args | dict(edge_dim=edge_dim)
-
+        # Initialize the sequence of PNA layers
         modules = []
 
         for i in range(self.num_layers):
+            # First layer processes input features, subsequent layers use intermediate features.
             if i == 0:
+                # Handle edge attributes if edge_dim is provided.
                 if self.edge_dim:
                     modules.append(
                         (
@@ -327,7 +343,7 @@ class VariationalPNAEncoder(pl.LightningModule):
                                 out_channels=intermediate_dim,
                                 **pna_common_args,
                             ),
-                            "x, edge_index, edge_attr -> x",
+                            "x, edge_index, edge_attr -> x", # Specify input-output mapping.
                         )
                     )
                 else:
@@ -338,10 +354,11 @@ class VariationalPNAEncoder(pl.LightningModule):
                                 out_channels=intermediate_dim,
                                 **pna_common_args,
                             ),
-                            "x, edge_index -> x",
+                            "x, edge_index -> x", # Mapping without edge attributes.
                         )
                     )
             else:
+                # Intermediate layers use the same process as above.
                 if self.edge_dim:
                     modules.append(
                         (
@@ -365,10 +382,12 @@ class VariationalPNAEncoder(pl.LightningModule):
                         )
                     )
 
+            # Optionally add Batch Normalization and ReLU activation.
             if self.use_batch_norm:
-                modules.append(BatchNorm(intermediate_dim))
-            modules.append(nn.ReLU(inplace=True))
+                modules.append(BatchNorm(intermediate_dim)) # Normalize features per batch.
+            modules.append(nn.ReLU(inplace=True)) # Apply ReLU activation.
 
+        # Define the sequential model with the appropriate inputs.
         if self.edge_dim:
             self.convs = torch_geometric.nn.Sequential(
                 "x, edge_index, edge_attr", modules
@@ -376,6 +395,7 @@ class VariationalPNAEncoder(pl.LightningModule):
         else:
             self.convs = torch_geometric.nn.Sequential("x, edge_index", modules)
 
+        # Separate layers for the mean (mu) and log standard deviation (sigma) in the latent space.
         self.conv_mu = PNAConv(
             in_channels=intermediate_dim, out_channels=out_channels, **pna_common_args
         )
@@ -384,11 +404,22 @@ class VariationalPNAEncoder(pl.LightningModule):
         )
 
     def forward(self, x, edge_index, edge_attr=None):
+        """
+        Forward pass through the variational encoder.
+        Args:
+            x: Node features.
+            edge_index: Graph connectivity (edge indices).
+            edge_attr: Edge features (optional).
+        Returns:
+            mu: Mean of the latent distribution.
+            sigma: Log standard deviation of the latent distribution.
+        """
+        # Pass through the convolutional layers.
         if self.edge_dim:
             x = self.convs(x, edge_index, edge_attr=edge_attr)
         else:
             x = self.convs(x, edge_index)
-
+        # Compute mean (mu) and log standard deviation (sigma).
         if self.edge_dim:
             mu = self.conv_mu(x, edge_index, edge_attr=edge_attr)
             sigma = self.conv_logstd(x, edge_index, edge_attr=edge_attr)
@@ -714,6 +745,34 @@ class PNA(pl.LightningModule):
 
 
 class Estimator(pl.LightningModule):
+    """
+    A PyTorch Lightning module for estimating properties of graphs using Graph Neural Networks (GNNs).
+    Attributes:
+        task_type: Type of task ("classification" or "regression").
+        num_features: Number of input features per node.
+        gnn_intermediate_dim: Number of hidden dimensions in GNN layers.
+        node_latent_dim: Size of the latent node representations.
+        graph_latent_dim: Size of the latent graph representations (optional).
+        train_dataset: Dataset used for training, required for PNA convolutions.
+        batch_size: Training batch size.
+        lr: Learning rate.
+        linear_output_size: Size of the final output layer.
+        auxiliary_dim: Dimension of auxiliary data to be concatenated with GNN embeddings (optional).
+        output_intermediate_dim: Intermediate dimension for output layers.
+        scaler: Scaler for normalizing input data (optional).
+        readout: Type of graph readout operation ("linear", "global_mean_pool", etc.).
+        max_num_atoms_in_mol: Maximum number of atoms in a molecule (for "linear" readout).
+        monitor_loss: Metric to monitor during training (e.g., "val_total_loss").
+        num_layers: Number of GNN layers.
+        use_batch_norm: Whether to apply batch normalization.
+        set_transformer_*: Parameters for the SetTransformer readout (optional).
+        edge_dim: Dimensionality of edge (bond) features (optional).
+        use_vgae: Whether to use a Variational Graph Auto-Encoder (VGAE).
+        linear_interim_dim: Hidden size of linear layers in "linear" readout.
+        linear_dropout_p: Dropout probability in linear layers.
+        conv_type: Type of GNN convolution layer ("GCN", "GIN", or "PNA").
+        only_train: If True, only train on graph-level features.
+    """
     def __init__(
         self,
         task_type: str,
@@ -744,8 +803,9 @@ class Estimator(pl.LightningModule):
         linear_dropout_p: float = 0.2,
         conv_type: str = "GCN",
         only_train: bool = False,
-    ):
+    ): # Arguments listed above
         super().__init__()
+        # Ensure valid task type, GNN type, and readout type
         assert task_type in ["classification", "regression"]
         assert conv_type in ["GCN", "GIN", "PNA"]
         assert readout in [
@@ -755,7 +815,8 @@ class Estimator(pl.LightningModule):
             "global_max_pool",
             "set_transformer",
         ]
-
+        
+        # Logging task and configuration
         print(
             "%s task with %d %s layers and %s readout."
             % (task_type.capitalize(), num_layers, conv_type, readout)
@@ -766,11 +827,13 @@ class Estimator(pl.LightningModule):
         else:
             print("NOT using batch normalisation.")
 
+        # Initialize attributes
         self.use_vgae = use_vgae
         self.edge_dim = edge_dim
         self.only_train = only_train
         self.graph_latent_dim = graph_latent_dim if self.only_train else node_latent_dim
         self.task_type = task_type
+        # Set up global pooling functions based on readout type
         self.global_pool_fn = (
             global_mean_pool
             if readout == "global_mean_pool"
@@ -786,6 +849,7 @@ class Estimator(pl.LightningModule):
         else:
             print("Using a non-variational GNN model.")
 
+        # Print detailed configuration
         if self.global_pool_fn:
             print("Using %s, graph_latent_dim not used." % (readout))
             print("Using %d latent node features." % node_latent_dim)
@@ -857,6 +921,7 @@ class Estimator(pl.LightningModule):
         self.train_graph_embeddings = defaultdict(list)
         self.test_graph_embeddings = defaultdict(list)
 
+        # Initialize GNN parameters
         gnn_args = dict(
             in_channels=num_features,
             out_channels=node_latent_dim,
@@ -866,11 +931,13 @@ class Estimator(pl.LightningModule):
             name=self.name,
         )
 
+        # Add optional arguments to GNN configuration
         if self.edge_dim:
             gnn_args = gnn_args | dict(edge_dim=self.edge_dim)
         if self.conv_type == "PNA":
             gnn_args = gnn_args | dict(train_dataset=train_dataset)
 
+        # Define GNN model based on configuration
         if self.conv_type == "GCN":
             if self.use_vgae:
                 self.gnn_model = VGAE(VariationalGCNEncoder(**gnn_args))
@@ -887,7 +954,9 @@ class Estimator(pl.LightningModule):
             else:
                 self.gnn_model = PNA(**gnn_args)
 
+        # Configure readout layer
         if self.readout == "linear":
+            # Linear readout maps node embeddings to graph-level embeddings
             self.linear_readout1 = nn.Linear(
                 self.max_num_atoms_in_mol * node_latent_dim, self.linear_interim_dim
             )
@@ -902,6 +971,7 @@ class Estimator(pl.LightningModule):
                 self.linear_dropout = nn.Dropout1d(p=self.linear_dropout_p)
 
         elif self.readout == "set_transformer":
+            # SetTransformer for graph-level readout
             self.st = SetTransformer(
                 dim_input=node_latent_dim,
                 num_outputs=32,
@@ -914,6 +984,7 @@ class Estimator(pl.LightningModule):
                 dropout=self.set_transformer_dropout,
             )
 
+        # Define final output layers
         if self.only_train:
             self.linear_output1 = nn.Linear(
                 self.graph_latent_dim + self.auxiliary_dim, 256
@@ -928,43 +999,45 @@ class Estimator(pl.LightningModule):
 
         self.linear_output2 = nn.Linear(256, self.linear_output_size)
 
+    # Forward pass method
     def forward(
         self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        batch: torch.Tensor,
-        aux_data: Optional[torch.Tensor] = None,
-        edge_attr: Optional[torch.Tensor] = None,
+        x: torch.Tensor, # Node feature matrix
+        edge_index: torch.Tensor, # Edge connectivity information
+        batch: torch.Tensor, # Batch mapping to group nodes into graphs
+        aux_data: Optional[torch.Tensor] = None, # Auxiliary data, if available
+        edge_attr: Optional[torch.Tensor] = None, # Edge feature matrix, if available
     ):
-        # 1. Obtain node embeddings
-        if self.use_vgae:
-            if self.edge_dim:
+        # Step 1: Obtain node embeddings using the selected GNN/VGAE model
+        if self.use_vgae: # If using Variational Graph Autoencoder
+            if self.edge_dim: # If edge features are provided
                 z = self.gnn_model.encode(x, edge_index, edge_attr=edge_attr)
-            else:
+            else: # Without edge features
                 z = self.gnn_model.encode(x, edge_index)
-        else:
+        else: # If not using VGAE
             if self.edge_dim:
                 z = self.gnn_model.forward(x, edge_index, edge_attr=edge_attr)
             else:
                 z = self.gnn_model.forward(x, edge_index)
 
-        # 2. Readout layer
+        # Step 2: Generate graph embeddings via the readout mechanism
         # Due to batching in PyTorch Geometric, the node embeddings must be regrouped into their original graphs
         # Details: https://pytorch-geometric.readthedocs.io/en/latest/notes/introduction.html
-
-        graph_embeddings_to_return = None
+        graph_embeddings_to_return = None # Placeholder for final graph embeddings
 
         # Simple global pooling of node features
         if self.only_train and self.global_pool_fn:
+            # Apply simple global pooling (sum, mean, or max)
             graph_embeddings = self.global_pool_fn(z, batch)
             graph_embeddings_to_return = graph_embeddings
 
         if self.only_train and not self.global_pool_fn and self.readout == "linear":
+            # Create dense graph representations for linear readout
             graph_embeddings, _ = to_dense_batch(
                 z, batch, fill_value=0, max_num_nodes=self.max_num_atoms_in_mol
             )
 
-            # Reshape to (current_batch_shape, flattened_node_features)
+            # Flatten the node features to form graph embeddings
             graph_embeddings = graph_embeddings.reshape(
                 graph_embeddings.shape[0],
                 self.max_num_atoms_in_mol * self.node_latent_dim,
@@ -985,7 +1058,7 @@ class Estimator(pl.LightningModule):
             graph_embeddings_to_return = graph_embeddings_without_relu
             graph_embeddings = graph_embeddings_without_relu.relu()
 
-            if self.linear_dropout_p > 0:
+            if self.linear_dropout_p > 0: # Apply dropout if enabled
                 graph_embeddings = self.linear_dropout(graph_embeddings)
 
         elif (
@@ -993,6 +1066,7 @@ class Estimator(pl.LightningModule):
             and not self.global_pool_fn
             and self.readout == "set_transformer"
         ):
+            # Use a Set Transformer for graph embeddings
             graph_embeddings, _ = to_dense_batch(
                 z, batch, fill_value=0, max_num_nodes=self.max_num_atoms_in_mol
             )
@@ -1001,6 +1075,7 @@ class Estimator(pl.LightningModule):
             graph_embeddings_to_return = graph_embeddings
 
         if not self.only_train:
+            # Combine different pooling strategies (sum, mean, max) into one representation
             graph_embeddings_sum = global_add_pool(z, batch)
             graph_embeddings_mean = global_mean_pool(z, batch)
             graph_embeddings_max = global_max_pool(z, batch)
@@ -1010,7 +1085,7 @@ class Estimator(pl.LightningModule):
             )
             graph_embeddings_to_return = graph_embeddings
 
-        # 2.1. Concatenate auxiliary data (labels or embeddings) as additional columns, when available
+        # Step 2.1: Concatenate auxiliary data (labels or embeddings) as additional columns, when available
         if self.auxiliary_dim > 0:
             assert len(aux_data.shape) == 1
             if self.auxiliary_dim == 1:
@@ -1027,8 +1102,7 @@ class Estimator(pl.LightningModule):
             # Actual concatenation
             graph_embeddings = torch.cat((graph_embeddings, aux_data), dim=1)
 
-        # 3. Apply a final classifier
-
+        # Step 3: Apply the final classifier to generate predictions
         if self.use_batch_norm:
             predictions = self.bn3(self.linear_output1(graph_embeddings)).relu()
         else:
@@ -1038,6 +1112,7 @@ class Estimator(pl.LightningModule):
 
         return z, graph_embeddings_to_return, predictions
 
+    # Configure optimizers and learning rate scheduler
     # Reduce learning rate when a metric has stopped improving
     # The ReduceLROnPlateau scheduler requires a monitor
     def configure_optimizers(self):
@@ -1045,24 +1120,23 @@ class Estimator(pl.LightningModule):
         return {
             "optimizer": opt,
             "lr_scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, factor=0.75, patience=15
+                opt, factor=0.75, patience=15 # Reduce learning rate when monitored loss plateaus
             ),
-            "monitor": self.monitor_loss,
+            "monitor": self.monitor_loss, # Metric to monitor for the scheduler
         }
-
+    # Compute the batch loss
     def _batch_loss(
         self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        y: Optional[torch.Tensor] = None,
-        batch_mapping: Optional[torch.Tensor] = None,
-        aux_data: Optional[torch.Tensor] = None,
-        edge_attr: Optional[torch.Tensor] = None,
+        x: torch.Tensor, # Node feature matrix
+        edge_index: torch.Tensor, # Edge connectivity
+        y: Optional[torch.Tensor] = None, # Target labels
+        batch_mapping: Optional[torch.Tensor] = None, # Mapping of nodes to graphs
+        aux_data: Optional[torch.Tensor] = None, # Auxiliary data, if any
+        edge_attr: Optional[torch.Tensor] = None, # Edge attributes, if any
     ):
-        # Number of nodes in graph
-        num_nodes = x.shape[0]
+        num_nodes = x.shape[0] # Total number of nodes in the batch/graph
 
-        # Forward pass
+        # Forward pass to get embeddings and predictions
         if not self.edge_dim:
             z, graph_embeddings, predictions = self.forward(
                 x, edge_index, batch_mapping, aux_data
@@ -1072,7 +1146,7 @@ class Estimator(pl.LightningModule):
                 x, edge_index, batch_mapping, aux_data, edge_attr
             )
 
-        # VGAE loss from https://github.com/rusty1s/pytorch_geometric/blob/master/examples/autoencoder.py
+        # Compute VGAE loss if using variational autoencoder. VGAE loss from https://github.com/rusty1s/pytorch_geometric/blob/master/examples/autoencoder.py
         if self.use_vgae:
             vgae_loss = self.gnn_model.recon_loss(z, edge_index)
             vgae_loss = vgae_loss + (1 / num_nodes) * self.gnn_model.kl_loss()
@@ -1080,17 +1154,19 @@ class Estimator(pl.LightningModule):
         predictions = predictions.reshape(-1, self.linear_output_size)
         y = y.reshape(-1, self.linear_output_size)
 
+        # Task-specific loss
         if self.task_type == "classification":
             task_loss = F.binary_cross_entropy_with_logits(
                 predictions, y.float()
             )
-
+    
         else:
             task_loss = F.mse_loss(
                 predictions,
                 y.float()
             )
 
+        # Combine losses
         if self.use_vgae:
             total_loss = vgae_loss + task_loss
             return total_loss, vgae_loss, task_loss, z, graph_embeddings, predictions
@@ -1098,18 +1174,19 @@ class Estimator(pl.LightningModule):
             total_loss = task_loss
             return total_loss, 0.0, 0.0, z, graph_embeddings, predictions
 
+    # Perform a training/validation/test step
     def _step(self, batch: torch.Tensor, step_type: str):
+        # Extract batch components
         # assert step_type in ['train', 'valid', 'test']
-
         x, edge_index, edge_attr, y, batch_mapping = (
-            batch.x,
-            batch.edge_index,
-            batch.edge_attr,
-            batch.y,
-            batch.batch,
+            batch.x, # Node features
+            batch.edge_index, # Edge connectivity
+            batch.edge_attr, # Edge features
+            batch.y, # Target labels
+            batch.batch, # Batch mapping
         )
-        aux_data = batch.aux_data
-
+        aux_data = batch.aux_data # Auxiliary data, if any
+        # Compute loss and predictions
         (
             total_loss,
             vgae_loss,
@@ -1119,8 +1196,9 @@ class Estimator(pl.LightningModule):
             predictions,
         ) = self._batch_loss(x, edge_index, y, batch_mapping, aux_data, edge_attr)
 
-        output = (predictions, y)
+        output = (predictions, y) # Store predictions and ground truth
 
+        # Log results based on the step type
         if step_type == "train":
             self.train_output[self.current_epoch].append(output)
         elif not self.only_train and step_type == "valid":
@@ -1132,49 +1210,51 @@ class Estimator(pl.LightningModule):
         return total_loss, vgae_loss, task_loss
 
     def training_step(self, batch: torch.Tensor, batch_idx: int):
-        # If not using VGAE, vgae_loss is set to 0 and train_total_loss = task_loss
+        # Perform one training step for the given batch.
+        # Calls _step to compute losses for the batch.
         train_total_loss, vgae_loss, task_loss = self._step(batch, "train")
-
+        # Log the losses. If VGAE is used, log all three losses; otherwise, log only the total loss.
         if self.use_vgae:
             self.log("train_total_loss", train_total_loss, batch_size=self.batch_size)
             self.log("train_vgae_loss", vgae_loss, batch_size=self.batch_size)
             self.log("train_task_loss", task_loss, batch_size=self.batch_size)
         else:
             self.log("train_total_loss", train_total_loss, batch_size=self.batch_size)
-
+        # Return the total training loss for optimization.
         return train_total_loss
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int):
+        # Perform one validation step for the given batch.
+        # Calls _step to compute losses for the batch.
         # edge_attr not used so far
-
-        # If not using VGAE, vgae_loss is set to 0 and val_total_loss = task_loss
         val_total_loss, vgae_loss, task_loss = self._step(batch, "valid")
-
+        # Log the losses. If VGAE is used, log all three losses; otherwise, log only the total loss.
         if self.use_vgae:
             self.log("val_total_loss", val_total_loss, batch_size=self.batch_size)
             self.log("val_vgae_loss", vgae_loss, batch_size=self.batch_size)
             self.log("val_task_loss", task_loss, batch_size=self.batch_size)
         else:
             self.log("val_total_loss", val_total_loss, batch_size=self.batch_size)
-
+        # Return the total validation loss.
         return val_total_loss
 
     def test_step(self, batch: torch.Tensor, batch_idx: int):
+        # Perform one test step for the given batch.
+        # Calls _step to compute losses for the batch.
         # edge_attr not used so far
-
-        # If not using VGAE, vgae_loss is set to 0 and test_total_loss = task_loss
         test_total_loss, vgae_loss, task_loss = self._step(batch, "test")
-
+        # Log the losses. If VGAE is used, log all three losses; otherwise, log only the total loss.
         if self.use_vgae:
             self.log("test_total_loss", test_total_loss, batch_size=self.batch_size)
             self.log("test_vgae_loss", vgae_loss, batch_size=self.batch_size)
             self.log("test_task_loss", task_loss, batch_size=self.batch_size)
         else:
             self.log("test_total_loss", test_total_loss, batch_size=self.batch_size)
-
+        # Return the total test loss.
         return test_total_loss
 
     def _epoch_end_report(self, epoch_outputs, epoch_type):
+        # Aggregates predictions and true values across the epoch.
         y_pred = (
             torch.cat([item[0] for item in epoch_outputs], dim=0)
             .detach()
@@ -1187,65 +1267,73 @@ class Estimator(pl.LightningModule):
             .cpu()
             .numpy()
         )
-
+        # Optionally inverse-transform predictions and true values using a scaler.
         if self.scaler:
             y_pred = self.scaler.inverse_transform(y_pred.reshape(-1, self.linear_output_size))
             y_true = self.scaler.inverse_transform(y_true.reshape(-1, self.linear_output_size))
-
+        # Convert predictions and true values back to tensors.
         y_pred = torch.from_numpy(y_pred)
         y_true = torch.from_numpy(y_true)
-
+        # Compute metrics based on task type (classification or regression).
         if self.task_type == "classification":
             y_true = y_true.long()
             metrics = get_metrics_cls_pt(y_true, y_pred)
         else:
             metrics = get_metrics_pt(y_true, y_pred)
-
+        # Log metrics for the given epoch type (e.g., Train, Validation, Test).
         for metric_name, metric_value in metrics.items():
             self.log(
                 f"{epoch_type} {metric_name}",
                 metric_value,
                 batch_size=self.batch_size,
             )
-
+        # Convert predictions and true values to numpy arrays for further processing.
         y_pred = y_pred.detach().cpu().numpy()
         y_true = y_true.detach().cpu().numpy()
 
         return metrics, y_pred, y_true
 
     def on_train_epoch_end(self):
+        # Perform actions at the end of the training epoch.
         if self.only_train:
+            # Generate a report for training metrics and store them.
             train_metrics, y_pred, y_true,= self._epoch_end_report(
-                self.train_output[self.current_epoch], epoch_type="Train"
-            )
+                self.train_output[self.current_epoch], epoch_type="Train")
 
             self.train_metrics[self.current_epoch] = train_metrics
-
+            # Clean up to free memory.
             del y_pred
             del y_true
             del self.train_output[self.current_epoch]
 
     def on_validation_epoch_end(self):
+        # Perform actions at the end of the validation epoch.
         if not self.only_train:
+            # Generate a report for validation metrics and store them.
             val_outputs_per_epoch = self.val_output[self.current_epoch]
             val_metrics, y_pred, y_true = self._epoch_end_report(val_outputs_per_epoch, epoch_type="Validation")
 
             self.val_metrics[self.current_epoch] = val_metrics
-
+            # Clean up to free memory.
             del y_pred
             del y_true
             del self.val_output[self.current_epoch]
 
     def on_test_epoch_end(self):
+        # Perform actions at the end of the test epoch.
         test_outputs_per_epoch = self.test_output[self.num_called_test]
         test_metrics, y_pred, y_true = self._epoch_end_report(test_outputs_per_epoch, epoch_type="Test")
 
+        # Generate a report for test metrics and store them.
         self.test_metrics[self.num_called_test] = test_metrics
 
+        # Store graph embeddings for the test results.
         self.test_graph_embeddings[self.num_called_test] = torch.cat(
             self.test_graph_embeddings[self.num_called_test]
         ).detach().cpu().numpy()
 
+        # Save predictions and true values for the test results.
         self.test_output[self.num_called_test] = y_pred
         self.test_true[self.num_called_test] = y_true
+        # Increment the test counter for subsequent test runs.
         self.num_called_test += 1
